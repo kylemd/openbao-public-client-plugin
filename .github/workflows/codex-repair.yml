@@ -54,7 +54,7 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
 
       - name: Repair JWT public-client compatibility
-        uses: openai/codex-action@b11346a6fa031e2e164ab4b7c7ea201afffd7d59 # v1
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: .github/codex/prompts/repair-public-client.md
