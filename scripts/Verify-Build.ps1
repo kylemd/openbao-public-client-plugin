@@ -55,11 +55,14 @@ try {
     $env:CGO_ENABLED = "0"
     $env:GOOS = "linux"
     $env:GOARCH = "amd64"
-    Invoke-Native go build `
-      -trimpath `
-      -ldflags="-s -w" `
-      -o $artifactPath `
+    Invoke-Native -FilePath go -Arguments @(
+      "build",
+      "-trimpath",
+      "-ldflags=-s -w",
+      "-o",
+      $artifactPath,
       $commandPackage
+    )
   }
   finally {
     $env:CGO_ENABLED = $previousCgo
