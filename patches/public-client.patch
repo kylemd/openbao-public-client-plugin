@@ -1,0 +1,232 @@
+diff --git a/builtin/credential/jwt/path_config.go b/builtin/credential/jwt/path_config.go
+index 5d614bff9cd9e672ac8119712f00001b051c3e56..3c5ff00df4829f2b5cb40a3ef8bad324a69ebf2e 100644
+--- a/builtin/credential/jwt/path_config.go
++++ b/builtin/credential/jwt/path_config.go
+@@ -61,7 +61,7 @@ func pathConfig(b *jwtAuthBackend) *framework.Path {
+ 			},
+ 			"oidc_client_secret": {
+ 				Type:        framework.TypeString,
+-				Description: "The OAuth Client Secret configured with your OIDC provider.",
++				Description: "The OAuth Client Secret configured with your OIDC provider. May be omitted for a public client using PKCE.",
+ 				DisplayAttrs: &framework.DisplayAttributes{
+ 					Sensitive: true,
+ 				},
+@@ -381,9 +381,8 @@ func (b *jwtAuthBackend) pathConfigWrite(ctx context.Context, req *logical.Reque
+ 	case methodCount != 1:
+ 		return logical.ErrorResponse("exactly one of 'jwt_validation_pubkeys', 'jwks_url', 'jwks_pairs', 'oidc_discovery_url', or 'provider_config' must be set"), nil
+ 
+-	case config.OIDCClientID != "" && config.OIDCClientSecret == "",
+-		config.OIDCClientID == "" && config.OIDCClientSecret != "":
+-		return logical.ErrorResponse("both 'oidc_client_id' and 'oidc_client_secret' must be set for OIDC"), nil
++	case config.OIDCClientID == "" && config.OIDCClientSecret != "":
++		return logical.ErrorResponse("'oidc_client_id' must be set when 'oidc_client_secret' is set"), nil
+ 
+ 	case config.OIDCDiscoveryURL != "":
+ 		if strings.Contains(config.OIDCDiscoveryURL, ".well-known/openid-configuration") {
+@@ -391,7 +390,7 @@ func (b *jwtAuthBackend) pathConfigWrite(ctx context.Context, req *logical.Reque
+ 		}
+ 
+ 		var err error
+-		if config.OIDCClientID != "" && config.OIDCClientSecret != "" {
++		if config.OIDCClientID != "" {
+ 			_, err = b.createProvider(config)
+ 		} else {
+ 			_, err = jwt.NewOIDCDiscoveryKeySet(ctx, config.OIDCDiscoveryURL, config.OIDCDiscoveryCAPEM)
+@@ -509,9 +508,25 @@ func (b *jwtAuthBackend) createProvider(config *jwtConfig) (*oidc.Provider, erro
+ 		supportedSigAlgs = []oidc.Alg{oidc.RS256}
+ 	}
+ 
++	options := []oidc.Option{oidc.WithProviderCA(config.OIDCDiscoveryCAPEM)}
++	if config.OIDCClientSecret == "" {
++		transport := cleanhttp.DefaultPooledTransport()
++		transport.TLSClientConfig = &tls.Config{}
++		if err := b.OverrideRootCAs(transport.TLSClientConfig, config.OIDCDiscoveryCAPEM); err != nil {
++			return nil, fmt.Errorf("error configuring public client CA: %w", err)
++		}
++		if err := b.OverrideAllowedServerNames(transport.TLSClientConfig, config.OverrideAllowedServerNames); err != nil {
++			return nil, fmt.Errorf("error configuring public client server names: %w", err)
++		}
++		options = []oidc.Option{oidc.WithRoundTripper(&publicClientRoundTripper{
++			clientID:      config.OIDCClientID,
++			baseTransport: transport,
++		})}
++	}
++
+ 	c, err := oidc.NewConfig(config.OIDCDiscoveryURL, config.OIDCClientID,
+ 		oidc.ClientSecret(config.OIDCClientSecret), supportedSigAlgs, []string{},
+-		oidc.WithProviderCA(config.OIDCDiscoveryCAPEM))
++		options...)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error creating provider: %w", err)
+ 	}
+@@ -524,6 +539,43 @@ func (b *jwtAuthBackend) createProvider(config *jwtConfig) (*oidc.Provider, erro
+ 	return provider, nil
+ }
+ 
++// publicClientRoundTripper converts oauth2's Basic-auth probe into the
++// unauthenticated token request required for an OAuth public client.
++type publicClientRoundTripper struct {
++	clientID      string
++	baseTransport http.RoundTripper
++}
++
++func (rt *publicClientRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	_, password, hasBasicAuth := req.BasicAuth()
++	if !hasBasicAuth || password != "" || req.Body == nil {
++		return rt.baseTransport.RoundTrip(req)
++	}
++
++	body, err := io.ReadAll(req.Body)
++	if err != nil {
++		return nil, err
++	}
++	values, err := url.ParseQuery(string(body))
++	if err != nil {
++		return nil, err
++	}
++	values.Set("client_id", rt.clientID)
++	values.Del("client_secret")
++	encodedBody := values.Encode()
++
++	publicRequest := req.Clone(req.Context())
++	publicRequest.Header = req.Header.Clone()
++	publicRequest.Header.Del("Authorization")
++	publicRequest.Body = io.NopCloser(strings.NewReader(encodedBody))
++	publicRequest.ContentLength = int64(len(encodedBody))
++	publicRequest.GetBody = func() (io.ReadCloser, error) {
++		return io.NopCloser(strings.NewReader(encodedBody)), nil
++	}
++
++	return rt.baseTransport.RoundTrip(publicRequest)
++}
++
+ // createCAContext returns a context with custom TLS client, configured with the root certificates
+ // from caPEM. If no certificates are configured, the original context is returned.
+ func (b *jwtAuthBackend) createCAContext(ctx context.Context, caPEM string, allowedServerNames []string) (context.Context, error) {
+@@ -652,7 +704,7 @@ func (c jwtConfig) authType() int {
+ 	case c.JWKSURL != "":
+ 		return JWKS
+ 	case c.OIDCDiscoveryURL != "":
+-		if c.OIDCClientID != "" && c.OIDCClientSecret != "" {
++		if c.OIDCClientID != "" {
+ 			return OIDCFlow
+ 		}
+ 		return OIDCDiscovery
+diff --git a/builtin/credential/jwt/path_config_test.go b/builtin/credential/jwt/path_config_test.go
+index d765ca480853ea0debbcd9322fb8a7fe4f6fee71..97e230a7e32ba56c406b82357d41310f071092e6 100644
+--- a/builtin/credential/jwt/path_config_test.go
++++ b/builtin/credential/jwt/path_config_test.go
+@@ -402,7 +402,7 @@ func TestConfig_OIDC_Write(t *testing.T) {
+ 
+ 	// Verify OIDC config sanity:
+ 	//   - if providing client id/secret, discovery URL needs to be set
+-	//   - both oidc client and secret should be provided if either one is
++	//   - a client secret cannot be provided without a client ID
+ 	tests := []struct {
+ 		id   string
+ 		data map[string]interface{}
+@@ -415,13 +415,6 @@ func TestConfig_OIDC_Write(t *testing.T) {
+ 				"oidc_client_secret":     "def",
+ 			},
+ 		},
+-		{
+-			"missing secret",
+-			map[string]interface{}{
+-				"oidc_discovery_url": "https://team-vault.auth0.com/",
+-				"oidc_client_id":     "abc",
+-			},
+-		},
+ 		{
+ 			"missing ID",
+ 			map[string]interface{}{
+diff --git a/builtin/credential/jwt/path_oidc_test.go b/builtin/credential/jwt/path_oidc_test.go
+index 7185b5c46053cd3d801edc750527d30fd661ac0c..8aa95a83fd3f7526980b32bf98d7f879890e81e7 100644
+--- a/builtin/credential/jwt/path_oidc_test.go
++++ b/builtin/credential/jwt/path_oidc_test.go
+@@ -1564,6 +1564,61 @@ func TestOIDC_Callback(t *testing.T) {
+ 	})
+ }
+ 
++func TestOIDC_PublicClientPKCE(t *testing.T) {
++	b, storage, s := getBackendAndServerWithClientSecret(t, false, "client", "")
++	defer s.server.Close()
++
++	const clientNonce = "public-client-nonce"
++	s.code = "public-client-code"
++
++	req := &logical.Request{
++		Operation: logical.UpdateOperation,
++		Path:      "oidc/auth_url",
++		Storage:   storage,
++		Data: map[string]interface{}{
++			"role":         "test",
++			"redirect_uri": "https://example.com",
++			"client_nonce": clientNonce,
++		},
++	}
++	resp, err := b.HandleRequest(t.Context(), req)
++	require.NoError(t, err)
++	require.False(t, resp.IsError())
++
++	authURL := resp.Data["auth_url"].(string)
++	require.Equal(t, "S256", getQueryParam(t, authURL, "code_challenge_method"))
++	s.codeChallenge = getQueryParam(t, authURL, "code_challenge")
++	s.customClaims = sampleClaims(getQueryParam(t, authURL, "nonce"))
++
++	req = &logical.Request{
++		Operation: logical.ReadOperation,
++		Path:      "oidc/callback",
++		Storage:   storage,
++		Data: map[string]interface{}{
++			"state":        getQueryParam(t, authURL, "state"),
++			"code":         s.code,
++			"client_nonce": clientNonce,
++		},
++	}
++	resp, err = b.HandleRequest(t.Context(), req)
++	require.NoError(t, err)
++	require.False(t, resp.IsError())
++	require.NotNil(t, resp.Auth)
++
++	var tokenRequest *http.Request
++	for _, providerRequest := range s.getRequests() {
++		if providerRequest.URL.Path == "/token" {
++			tokenRequest = providerRequest
++			break
++		}
++	}
++	require.NotNil(t, tokenRequest)
++	require.Empty(t, tokenRequest.Header.Get("Authorization"))
++	require.Equal(t, s.clientID, tokenRequest.Form.Get("client_id"))
++	require.Empty(t, tokenRequest.Form.Get("client_secret"))
++	require.NotEmpty(t, tokenRequest.Form.Get("code_verifier"))
++}
++
+ // oidcProvider is a local server that mocks the basis endpoints used by the
+ // OIDC callback process.
+ type oidcProvider struct {
+@@ -1805,10 +1860,14 @@ func TestOIDC_ValidRedirect(t *testing.T) {
+ }
+ 
+ func getBackendAndServer(t *testing.T, boundCIDRs bool, callbackMode string) (logical.Backend, logical.Storage, *oidcProvider) {
++	return getBackendAndServerWithClientSecret(t, boundCIDRs, callbackMode, "def")
++}
++
++func getBackendAndServerWithClientSecret(t *testing.T, boundCIDRs bool, callbackMode, clientSecret string) (logical.Backend, logical.Storage, *oidcProvider) {
+ 	b, storage := getBackend(t)
+ 	s := newOIDCProvider(t)
+ 	s.clientID = "abc"
+-	s.clientSecret = "def"
++	s.clientSecret = clientSecret
+ 
+ 	cert, err := s.getTLSCert()
+ 	if err != nil {
+@@ -1819,7 +1878,7 @@ func getBackendAndServer(t *testing.T, boundCIDRs bool, callbackMode string) (lo
+ 	data := map[string]interface{}{
+ 		"oidc_discovery_url":    s.server.URL,
+ 		"oidc_client_id":        "abc",
+-		"oidc_client_secret":    "def",
++		"oidc_client_secret":    clientSecret,
+ 		"oidc_discovery_ca_pem": cert,
+ 		"default_role":          "test",
+ 		"bound_issuer":          "http://vault.example.com/",

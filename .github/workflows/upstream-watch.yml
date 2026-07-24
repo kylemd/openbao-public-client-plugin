@@ -1,0 +1,90 @@
+name: Upstream Watch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 14 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: update
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out overlay
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+
+      - name: Check for a stable OpenBao release
+        shell: pwsh
+        run: ./scripts/Update-Lock.ps1
+
+      - name: Stop when current
+        id: changed
+        shell: bash
+        run: |
+          if git diff --quiet -- openbao.lock.json; then
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create update branch and pull request
+        if: steps.changed.outputs.value == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="$(jq -r .release_tag openbao.lock.json)"
+          branch="automation/openbao-${release#v}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add openbao.lock.json
+          git commit -m "chore: track OpenBao $release"
+          git push --force origin "$branch"
+          pr="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number')"
+          if [ -z "$pr" ]; then
+            url="$(gh pr create \
+              --base main \
+              --head "$branch" \
+              --label upstream-sync \
+              --title "chore: track OpenBao $release" \
+              --body "Updates the exact OpenBao release lock. Merge is gated by clean patch application, tests, vulnerability scanning, CodeQL, artifact generation, SBOM, and provenance.")"
+            pr="$(gh pr view "$url" --json number --jq .number)"
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(jq -r .go_version openbao.lock.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up locked Go version
+        if: steps.changed.outputs.value == 'true'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
+        with:
+          go-version: ${{ steps.pr.outputs.go_version }}
+          cache: false
+
+      - name: Install vulnerability scanner
+        if: steps.changed.outputs.value == 'true'
+        shell: bash
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Verify update before enabling auto-merge
+        if: steps.changed.outputs.value == 'true'
+        shell: pwsh
+        run: ./scripts/Verify-Build.ps1 -RequireVulnerabilityCheck
+
+      - name: Enable gated auto-merge
+        if: steps.changed.outputs.value == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        shell: bash
+        run: gh pr merge "$PR_NUMBER" --auto --squash --delete-branch

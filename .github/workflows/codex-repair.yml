@@ -1,0 +1,178 @@
+name: Codex Repair
+
+on:
+  workflow_run:
+    workflows:
+      - Upstream Watch
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    name: repair
+    if: github.event.workflow_run.conclusion == 'failure' && vars.CODEX_REPAIR_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out overlay
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check out failed update branch
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="$(gh pr list --state open --label upstream-sync --json headRefName --jq '.[0].headRefName')"
+          test -n "$branch"
+          git fetch origin "$branch"
+          git switch --detach FETCH_HEAD
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(jq -r .go_version openbao.lock.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up locked Go version
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.0.0
+        with:
+          go-version: ${{ steps.base.outputs.go_version }}
+          cache: false
+
+      - name: Prepare source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pwsh ./scripts/Prepare-Upstream.ps1 -SkipPatch
+          plugin_path="$(jq -r .plugin_source_path openbao.lock.json)"
+          (cd .work/openbao && go mod download && go test "./$plugin_path/..." -run '^$')
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Repair JWT public-client compatibility
+        uses: openai/codex-action@b11346a6fa031e2e164ab4b7c7ea201afffd7d59 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/repair-public-client.md
+          permission-profile: :workspace
+          safety-strategy: drop-sudo
+          allow-bots: true
+          allow-bot-users: github-actions
+          effort: high
+
+      - name: Validate and package repair
+        env:
+          BASE_BRANCH: ${{ steps.base.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          plugin_path="$(jq -r .plugin_source_path openbao.lock.json)"
+          changed="$(git -C .work/openbao diff --name-only)"
+          test -n "$changed"
+          while IFS= read -r path; do
+            case "$path" in
+              "$plugin_path"/*) ;;
+              *) echo "Unexpected source change: $path" >&2; exit 1 ;;
+            esac
+          done <<< "$changed"
+          pwsh ./scripts/New-Patch.ps1
+          test "$(git diff --name-only | tr -d '\r')" = "patches/public-client.patch"
+          pwsh ./scripts/Verify-Build.ps1 -RequireVulnerabilityCheck
+          git diff --binary -- patches/public-client.patch > codex-repair.patch
+          jq -n --arg base "$BASE_BRANCH" '{"base_branch":$base}' > repair-meta.json
+
+      - name: Upload validated repair
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-repair-${{ github.run_id }}
+          path: |
+            codex-repair.patch
+            repair-meta.json
+          if-no-files-found: error
+          retention-days: 7
+
+  write-pr:
+    name: write-pr
+    needs: repair
+    if: needs.repair.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out overlay
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+
+      - name: Download validated repair
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: codex-repair-${{ github.run_id }}
+
+      - name: Open draft repair pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(jq -r .base_branch repair-meta.json)"
+          branch="codex/repair-openbao-${GITHUB_RUN_ID}"
+          git fetch origin "$base"
+          git switch -c "$branch" FETCH_HEAD
+          git apply --check codex-repair.patch
+          git apply codex-repair.patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add patches/public-client.patch
+          git commit -m "fix: repair public-client patch for OpenBao update"
+          git push origin "$branch"
+          gh pr create \
+            --draft \
+            --base "$base" \
+            --head "$branch" \
+            --label maintenance \
+            --title "fix: repair public-client patch for OpenBao update" \
+            --body "Codex proposed this narrow patch repair. A separate credentialed job opened this draft only after path checks, patch-size enforcement, full JWT tests, race detection, vet, vulnerability scanning, and a Linux build passed."
+
+  notify:
+    name: notify
+    needs:
+      - repair
+      - write-pr
+    if: >-
+      always() &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      (vars.CODEX_REPAIR_ENABLED != 'true' ||
+       needs.repair.result == 'failure' ||
+       needs.write-pr.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create maintenance issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAILED_RUN: ${{ github.event.workflow_run.html_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --label maintenance \
+            --search '"Automated OpenBao update needs attention" in:title' \
+            --json number --jq '.[0].number')"
+          if [ -z "$existing" ]; then
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --label maintenance \
+              --title "Automated OpenBao update needs attention" \
+              --body "The upstream watcher failed: $FAILED_RUN. Codex repair is disabled or did not produce a validated draft pull request. Review the failed run without placing provider credentials or token material in this public issue."
+          else
+            gh issue comment "$existing" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "Another upstream watcher failed: $FAILED_RUN"
+          fi
