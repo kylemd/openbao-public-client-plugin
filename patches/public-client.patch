@@ -1,5 +1,5 @@
 diff --git a/builtin/credential/jwt/path_config.go b/builtin/credential/jwt/path_config.go
-index 5d614bff9cd9e672ac8119712f00001b051c3e56..3c5ff00df4829f2b5cb40a3ef8bad324a69ebf2e 100644
+index 5d614bff9cd9e672ac8119712f00001b051c3e56..b8f5bee0c1366217646d47aad508dce91c36a0b3 100644
 --- a/builtin/credential/jwt/path_config.go
 +++ b/builtin/credential/jwt/path_config.go
 @@ -61,7 +61,7 @@ func pathConfig(b *jwtAuthBackend) *framework.Path {
@@ -59,7 +59,7 @@ index 5d614bff9cd9e672ac8119712f00001b051c3e56..3c5ff00df4829f2b5cb40a3ef8bad324
  	if err != nil {
  		return nil, fmt.Errorf("error creating provider: %w", err)
  	}
-@@ -524,6 +539,43 @@ func (b *jwtAuthBackend) createProvider(config *jwtConfig) (*oidc.Provider, erro
+@@ -524,6 +539,47 @@ func (b *jwtAuthBackend) createProvider(config *jwtConfig) (*oidc.Provider, erro
  	return provider, nil
  }
  
@@ -71,9 +71,15 @@ index 5d614bff9cd9e672ac8119712f00001b051c3e56..3c5ff00df4829f2b5cb40a3ef8bad324
 +}
 +
 +func (rt *publicClientRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	publicRequest := req.Clone(req.Context())
++	publicRequest.Header = req.Header.Clone()
++	if publicRequest.Header.Get("User-Agent") == "" {
++		publicRequest.Header.Set("User-Agent", "OpenBao OIDC public client")
++	}
++
 +	_, password, hasBasicAuth := req.BasicAuth()
 +	if !hasBasicAuth || password != "" || req.Body == nil {
-+		return rt.baseTransport.RoundTrip(req)
++		return rt.baseTransport.RoundTrip(publicRequest)
 +	}
 +
 +	body, err := io.ReadAll(req.Body)
@@ -88,8 +94,6 @@ index 5d614bff9cd9e672ac8119712f00001b051c3e56..3c5ff00df4829f2b5cb40a3ef8bad324
 +	values.Del("client_secret")
 +	encodedBody := values.Encode()
 +
-+	publicRequest := req.Clone(req.Context())
-+	publicRequest.Header = req.Header.Clone()
 +	publicRequest.Header.Del("Authorization")
 +	publicRequest.Body = io.NopCloser(strings.NewReader(encodedBody))
 +	publicRequest.ContentLength = int64(len(encodedBody))
@@ -103,7 +107,7 @@ index 5d614bff9cd9e672ac8119712f00001b051c3e56..3c5ff00df4829f2b5cb40a3ef8bad324
  // createCAContext returns a context with custom TLS client, configured with the root certificates
  // from caPEM. If no certificates are configured, the original context is returned.
  func (b *jwtAuthBackend) createCAContext(ctx context.Context, caPEM string, allowedServerNames []string) (context.Context, error) {
-@@ -652,7 +704,7 @@ func (c jwtConfig) authType() int {
+@@ -652,7 +708,7 @@ func (c jwtConfig) authType() int {
  	case c.JWKSURL != "":
  		return JWKS
  	case c.OIDCDiscoveryURL != "":
@@ -113,7 +117,7 @@ index 5d614bff9cd9e672ac8119712f00001b051c3e56..3c5ff00df4829f2b5cb40a3ef8bad324
  		}
  		return OIDCDiscovery
 diff --git a/builtin/credential/jwt/path_config_test.go b/builtin/credential/jwt/path_config_test.go
-index d765ca480853ea0debbcd9322fb8a7fe4f6fee71..97e230a7e32ba56c406b82357d41310f071092e6 100644
+index d765ca480853ea0debbcd9322fb8a7fe4f6fee71..ab8252548da12144607455f836c8afe8a33737de 100644
 --- a/builtin/credential/jwt/path_config_test.go
 +++ b/builtin/credential/jwt/path_config_test.go
 @@ -402,7 +402,7 @@ func TestConfig_OIDC_Write(t *testing.T) {
@@ -139,6 +143,40 @@ index d765ca480853ea0debbcd9322fb8a7fe4f6fee71..97e230a7e32ba56c406b82357d41310f
  		{
  			"missing ID",
  			map[string]interface{}{
+@@ -875,6 +868,33 @@ func TestConfig_CAContext_MismatchedHost(t *testing.T) {
+ 	}
+ }
+ 
++func TestPublicClientRoundTripperUserAgent(t *testing.T) {
++	userAgents := make(chan string, 2)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		userAgents <- r.UserAgent()
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	t.Cleanup(server.Close)
++
++	transport := &publicClientRoundTripper{
++		clientID:      "public-client",
++		baseTransport: server.Client().Transport,
++	}
++	for _, userAgent := range []string{"", "provider-specific-client"} {
++		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
++		require.NoError(t, err)
++		if userAgent != "" {
++			request.Header.Set("User-Agent", userAgent)
++		}
++		response, err := transport.RoundTrip(request)
++		require.NoError(t, err)
++		response.Body.Close()
++	}
++
++	assert.Equal(t, "OpenBao OIDC public client", <-userAgents)
++	assert.Equal(t, "provider-specific-client", <-userAgents)
++}
++
+ func getCertificate(hostname string) (serverTLSConf *tls.Config, caPEM *bytes.Buffer, err error) {
+ 	ca := &x509.Certificate{
+ 		SerialNumber: big.NewInt(2019),
 diff --git a/builtin/credential/jwt/path_oidc_test.go b/builtin/credential/jwt/path_oidc_test.go
 index 7185b5c46053cd3d801edc750527d30fd661ac0c..8aa95a83fd3f7526980b32bf98d7f879890e81e7 100644
 --- a/builtin/credential/jwt/path_oidc_test.go
