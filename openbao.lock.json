@@ -6,6 +6,6 @@
   "release_commit": "ba7ad8861d0578cd4da4f7b9e5a6756d30484f8f",
   "plugin_source_path": "builtin/credential/jwt",
   "go_version": "1.26.5",
-  "patch_revision": 1,
+  "patch_revision": 2,
   "artifact_name": "openbao-plugin-auth-jwt-public-client-linux-amd64"
 }

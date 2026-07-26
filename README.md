@@ -9,6 +9,11 @@ official `openbao/openbao` release recorded in `openbao.lock.json`, verifies
 the commit, applies `patches/public-client.patch`, tests the JWT backend, and
 builds a Linux AMD64 plugin.
 
+For public clients, the overlay also supplies a neutral OpenBao user agent on
+OIDC discovery and token requests when the caller did not set one. This avoids
+provider edge filters that reject Go's default transport user agent without
+adding provider-specific headers or endpoints to the plugin.
+
 ## Security Model
 
 - Official OpenBao source is fetched from a pinned release tag and commit.
