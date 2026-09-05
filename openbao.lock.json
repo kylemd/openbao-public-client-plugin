@@ -2,10 +2,10 @@
   "schema_version": 1,
   "upstream_slug": "openbao/openbao",
   "upstream_url": "https://github.com/openbao/openbao.git",
-  "release_tag": "v2.6.1",
-  "release_commit": "ba7ad8861d0578cd4da4f7b9e5a6756d30484f8f",
+  "release_tag": "v2.6.2",
+  "release_commit": "dd9c19c37a878cf4a81b18efb8d6f0599c7da923",
   "plugin_source_path": "builtin/credential/jwt",
-  "go_version": "1.26.5",
+  "go_version": "1.26.6",
   "patch_revision": 2,
   "artifact_name": "openbao-plugin-auth-jwt-public-client-linux-amd64"
 }
